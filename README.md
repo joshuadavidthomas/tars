@@ -2,7 +2,7 @@
 
 A terminal-based agent.
 
-This is mainly for personal study, built for experimenting and understanding how agent loops work.
+This is mainly for personal study, built for experimenting and understanding how agent loops work and getting familiar with the terminal and the tricks needed to build a good TUI application.
 
 ## Usage
 
@@ -14,8 +14,8 @@ cargo run
 
 ## Inspirations
 
-- ["How to Build an Agent"](https://ampcode.com/how-to-build-an-agent) Thorsten Ball
-- ["how to build a coding agent" workshop](https://ghuntley.com/agent/) ([Repo](https://github.com/ghuntley/how-to-build-a-coding-agent)), Geoffrey Huntley
+- [How to Build an Agent](https://ampcode.com/how-to-build-an-agent), Thorsten Ball
+- [how to build a coding agent](https://ghuntley.com/agent/), Geoffrey Huntley
 
 ## License
 
