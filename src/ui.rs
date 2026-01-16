@@ -1,7 +1,7 @@
 use crate::agent::Agent;
 use crate::ai_sdk::{
-    assistant_content_from_response, AssistantMessage, ContentBlock, MessageParam,
-    ResponseContentBlock, UserMessage,
+    AssistantMessage, ContentBlock, MessageParam, ResponseContentBlock, UserMessage,
+    assistant_content_from_response,
 };
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -10,8 +10,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use std::fmt::Display;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
@@ -42,14 +43,8 @@ impl Drop for TerminalGuard {
 pub enum ChatMessage {
     User(String),
     Assistant(String),
-    ToolUse {
-        name: String,
-        input: String,
-    },
-    ToolResult {
-        content: String,
-        is_error: bool,
-    },
+    ToolUse { name: String, input: String },
+    ToolResult { content: String, is_error: bool },
     Info(String),
 }
 
@@ -150,7 +145,7 @@ impl ChatMessage {
         let mut total = 0usize;
         for line in self.plain_lines() {
             let len = line.len().max(1);
-            total += (len + width - 1) / width;
+            total += len.div_ceil(width);
         }
         total as u16
     }
@@ -268,10 +263,6 @@ impl InputBuffer {
         }
     }
 
-    fn to_string(&self) -> String {
-        self.lines.join("\n")
-    }
-
     fn is_empty(&self) -> bool {
         self.lines.iter().all(|l| l.is_empty())
     }
@@ -295,6 +286,12 @@ impl InputBuffer {
 impl Default for InputBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Display for InputBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.lines.join("\n"))
     }
 }
 
@@ -392,13 +389,7 @@ impl App {
                     )?;
                 }
                 UiEvent::ToolResult { content, is_error } => {
-                    self.append_message(
-                        terminal,
-                        ChatMessage::ToolResult {
-                            content,
-                            is_error,
-                        },
-                    )?;
+                    self.append_message(terminal, ChatMessage::ToolResult { content, is_error })?;
                 }
                 UiEvent::Error(err) => {
                     self.append_message(terminal, ChatMessage::Info(format!("Error: {}", err)))?;
@@ -417,167 +408,158 @@ impl App {
             }
         }
 
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
-                {
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                let _ = self.sender.try_send(UiEvent::Quit);
+                return Ok(false);
+            }
+
+            match key.code {
+                KeyCode::Esc => {
                     self.should_quit = true;
                     let _ = self.sender.try_send(UiEvent::Quit);
                     return Ok(false);
                 }
+                KeyCode::Enter => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.input.new_line();
+                    } else if !self.input.is_empty() {
+                        let msg = self.input.to_string();
+                        if !msg.trim().is_empty() {
+                            self.append_message(terminal, ChatMessage::User(msg.clone()))?;
+                            self.conversation
+                                .push(MessageParam::User(UserMessage::from_text(msg.clone())));
+                            self.input.clear();
+                            self.is_loading = true;
 
-                match key.code {
-                    KeyCode::Esc => {
-                        self.should_quit = true;
-                        let _ = self.sender.try_send(UiEvent::Quit);
-                        return Ok(false);
-                    }
-                    KeyCode::Enter => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            self.input.new_line();
-                        } else if !self.input.is_empty() {
-                            let msg = self.input.to_string();
-                            if !msg.trim().is_empty() {
-                                self.append_message(terminal, ChatMessage::User(msg.clone()))?;
-                                self.conversation
-                                    .push(MessageParam::User(UserMessage::from_text(msg.clone())));
-                                self.input.clear();
-                                self.is_loading = true;
+                            let mut current_conversation = self.conversation.clone();
 
-                                let mut current_conversation = self.conversation.clone();
+                            let agent = Arc::clone(&self.agent);
+                            let sender = self.sender.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    match agent.run_inference(current_conversation.as_slice()).await
+                                    {
+                                        Ok(response) => {
+                                            let mut tool_results: Vec<ContentBlock> = Vec::new();
 
-                                let agent = Arc::clone(&self.agent);
-                                let sender = self.sender.clone();
-                                tokio::spawn(async move {
-                                    loop {
-                                        match agent
-                                            .run_inference(current_conversation.as_slice())
-                                            .await
-                                        {
-                                            Ok(response) => {
-                                                let mut tool_results: Vec<ContentBlock> =
-                                                    Vec::new();
+                                            for content in &response.content {
+                                                match content {
+                                                    ResponseContentBlock::Text { text } => {
+                                                        let _ = sender
+                                                            .send(UiEvent::ApiResponse(
+                                                                text.clone(),
+                                                            ))
+                                                            .await;
+                                                    }
+                                                    ResponseContentBlock::ToolUse {
+                                                        id,
+                                                        name,
+                                                        input,
+                                                    } => {
+                                                        let _ = sender
+                                                            .send(UiEvent::ToolCall {
+                                                                name: name.clone(),
+                                                                input: input.clone(),
+                                                            })
+                                                            .await;
 
-                                                for content in &response.content {
-                                                    match content {
-                                                        ResponseContentBlock::Text { text } => {
-                                                            let _ = sender
-                                                                .send(UiEvent::ApiResponse(
-                                                                    text.clone(),
-                                                                ))
-                                                                .await;
-                                                        }
-                                                        ResponseContentBlock::ToolUse {
-                                                            id,
-                                                            name,
-                                                            input,
-                                                        } => {
-                                                            let _ = sender
-                                                                .send(UiEvent::ToolCall {
-                                                                    name: name.clone(),
-                                                                    input: input.clone(),
-                                                                })
-                                                                .await;
+                                                        let result = agent
+                                                            .execute_tool(
+                                                                id.clone(),
+                                                                name.clone(),
+                                                                input.clone(),
+                                                            )
+                                                            .await;
 
-                                                            let result = agent
-                                                                .execute_tool(
-                                                                    id.clone(),
-                                                                    name.clone(),
-                                                                    input.clone(),
-                                                                )
-                                                                .await;
+                                                        let (content, is_error) = match &result {
+                                                            ContentBlock::ToolResult {
+                                                                content,
+                                                                is_error,
+                                                                ..
+                                                            } => (
+                                                                content.clone(),
+                                                                is_error.unwrap_or(false),
+                                                            ),
+                                                            _ => (String::new(), false),
+                                                        };
 
-                                                            let (content, is_error) =
-                                                                match &result {
-                                                                    ContentBlock::ToolResult {
-                                                                        content,
-                                                                        is_error,
-                                                                        ..
-                                                                    } => (
-                                                                        content.clone(),
-                                                                        is_error.unwrap_or(false),
-                                                                    ),
-                                                                    _ => (String::new(), false),
-                                                                };
+                                                        let _ = sender
+                                                            .send(UiEvent::ToolResult {
+                                                                content,
+                                                                is_error,
+                                                            })
+                                                            .await;
 
-                                                            let _ = sender
-                                                                .send(UiEvent::ToolResult {
-                                                                    content,
-                                                                    is_error,
-                                                                })
-                                                                .await;
-
-                                                            tool_results.push(result);
-                                                        }
+                                                        tool_results.push(result);
                                                     }
                                                 }
-
-                                                let assistant_content =
-                                                    assistant_content_from_response(&response);
-
-                                                let assistant_message = MessageParam::Assistant(
-                                                    AssistantMessage::new(assistant_content),
-                                                );
-                                                current_conversation
-                                                    .push(assistant_message.clone());
-                                                let _ = sender
-                                                    .send(UiEvent::ConversationAppend(
-                                                        assistant_message,
-                                                    ))
-                                                    .await;
-
-                                                if tool_results.is_empty() {
-                                                    break;
-                                                }
-
-                                                let tool_message = MessageParam::User(
-                                                    UserMessage::new(tool_results),
-                                                );
-                                                current_conversation.push(tool_message.clone());
-                                                let _ = sender
-                                                    .send(UiEvent::ConversationAppend(
-                                                        tool_message,
-                                                    ))
-                                                    .await;
                                             }
-                                            Err(e) => {
-                                                let _ =
-                                                    sender.send(UiEvent::Error(e.to_string())).await;
+
+                                            let assistant_content =
+                                                assistant_content_from_response(&response);
+
+                                            let assistant_message = MessageParam::Assistant(
+                                                AssistantMessage::new(assistant_content),
+                                            );
+                                            current_conversation.push(assistant_message.clone());
+                                            let _ = sender
+                                                .send(UiEvent::ConversationAppend(
+                                                    assistant_message,
+                                                ))
+                                                .await;
+
+                                            if tool_results.is_empty() {
                                                 break;
                                             }
+
+                                            let tool_message =
+                                                MessageParam::User(UserMessage::new(tool_results));
+                                            current_conversation.push(tool_message.clone());
+                                            let _ = sender
+                                                .send(UiEvent::ConversationAppend(tool_message))
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            let _ =
+                                                sender.send(UiEvent::Error(e.to_string())).await;
+                                            break;
                                         }
                                     }
-                                    let _ = sender.send(UiEvent::Info("Done".to_string())).await;
-                                });
-                            }
+                                }
+                                let _ = sender.send(UiEvent::Info("Done".to_string())).await;
+                            });
                         }
                     }
-                    KeyCode::Char(c) => {
-                        self.input.insert_char(c);
-                    }
-                    KeyCode::Backspace => {
-                        self.input.delete_char();
-                    }
-                    KeyCode::Left => {
-                        self.input.move_left();
-                    }
-                    KeyCode::Right => {
-                        self.input.move_right();
-                    }
-                    KeyCode::Up => {
-                        self.input.move_up();
-                    }
-                    KeyCode::Down => {
-                        self.input.move_down();
-                    }
-                    KeyCode::Home => {
-                        self.input.cursor_x = 0;
-                    }
-                    KeyCode::End => {
-                        self.input.cursor_x = self.input.lines[self.input.cursor_y].len();
-                    }
-                    _ => {}
                 }
+                KeyCode::Char(c) => {
+                    self.input.insert_char(c);
+                }
+                KeyCode::Backspace => {
+                    self.input.delete_char();
+                }
+                KeyCode::Left => {
+                    self.input.move_left();
+                }
+                KeyCode::Right => {
+                    self.input.move_right();
+                }
+                KeyCode::Up => {
+                    self.input.move_up();
+                }
+                KeyCode::Down => {
+                    self.input.move_down();
+                }
+                KeyCode::Home => {
+                    self.input.cursor_x = 0;
+                }
+                KeyCode::End => {
+                    self.input.cursor_x = self.input.lines[self.input.cursor_y].len();
+                }
+                _ => {}
             }
         }
 
@@ -621,6 +603,12 @@ pub fn run_tui(agent: Agent) -> Result<(), Box<dyn std::error::Error + Send + Sy
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    terminal.draw(|f| {
+        let area = f.area();
+        f.render_widget(Clear, area);
+        // Place the shell prompt at the top of the cleared inline viewport.
+        f.set_cursor_position((area.x, area.y));
+    })?;
     disable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.flush()?;
