@@ -2,7 +2,7 @@
 
 A terminal-based agent.
 
-This is mainly for personal study, built for experimenting and understanding how agent loops work and getting familiar with the terminal and the tricks needed to build a good TUI application.
+This is mainly for personal study, built for experimenting and understanding how agent loops work, as well as getting familiar with the terminal and the tricks needed to build a good TUI application.
 
 ## Usage
 
