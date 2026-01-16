@@ -1,8 +1,5 @@
-use crate::agent::Agent;
-use crate::ai_sdk::{
-    AssistantMessage, ContentBlock, MessageParam, ResponseContentBlock, UserMessage,
-    assistant_content_from_response,
-};
+use crate::client::ClientSession;
+use crate::protocol::StreamEvent;
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -162,7 +159,6 @@ impl ChatMessage {
 
 #[derive(Debug)]
 pub enum UiEvent {
-    ConversationAppend(MessageParam),
     ApiResponse(String),
     ToolCall {
         name: String,
@@ -174,6 +170,7 @@ pub enum UiEvent {
     },
     Error(String),
     Info(String),
+    Done,
     Quit,
 }
 
@@ -302,12 +299,11 @@ pub struct App {
     sender: mpsc::Sender<UiEvent>,
     receiver: mpsc::Receiver<UiEvent>,
     is_loading: bool,
-    agent: Arc<Agent>,
-    conversation: Vec<MessageParam>,
+    client: Arc<ClientSession>,
 }
 
 impl App {
-    pub fn new(agent: Agent) -> Self {
+    pub fn new(client: ClientSession) -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
         Self {
@@ -317,8 +313,7 @@ impl App {
             sender,
             receiver,
             is_loading: false,
-            agent: Arc::new(agent),
-            conversation: Vec::new(),
+            client: Arc::new(client),
         }
     }
 
@@ -376,9 +371,6 @@ impl App {
                     self.append_message(terminal, ChatMessage::Assistant(msg))?;
                     self.is_loading = false;
                 }
-                UiEvent::ConversationAppend(message) => {
-                    self.conversation.push(message);
-                }
                 UiEvent::ToolCall { name, input } => {
                     self.append_message(
                         terminal,
@@ -396,9 +388,10 @@ impl App {
                     self.is_loading = false;
                 }
                 UiEvent::Info(msg) => {
-                    if msg != "Done" {
-                        self.append_message(terminal, ChatMessage::Info(msg))?;
-                    }
+                    self.append_message(terminal, ChatMessage::Info(msg))?;
+                    self.is_loading = false;
+                }
+                UiEvent::Done => {
                     self.is_loading = false;
                 }
                 UiEvent::Quit => {
@@ -430,107 +423,14 @@ impl App {
                         let msg = self.input.to_string();
                         if !msg.trim().is_empty() {
                             self.append_message(terminal, ChatMessage::User(msg.clone()))?;
-                            self.conversation
-                                .push(MessageParam::User(UserMessage::from_text(msg.clone())));
                             self.input.clear();
                             self.is_loading = true;
-
-                            let mut current_conversation = self.conversation.clone();
-
-                            let agent = Arc::clone(&self.agent);
+                            let client = Arc::clone(&self.client);
                             let sender = self.sender.clone();
                             tokio::spawn(async move {
-                                loop {
-                                    match agent.run_inference(current_conversation.as_slice()).await
-                                    {
-                                        Ok(response) => {
-                                            let mut tool_results: Vec<ContentBlock> = Vec::new();
-
-                                            for content in &response.content {
-                                                match content {
-                                                    ResponseContentBlock::Text { text } => {
-                                                        let _ = sender
-                                                            .send(UiEvent::ApiResponse(
-                                                                text.clone(),
-                                                            ))
-                                                            .await;
-                                                    }
-                                                    ResponseContentBlock::ToolUse {
-                                                        id,
-                                                        name,
-                                                        input,
-                                                    } => {
-                                                        let _ = sender
-                                                            .send(UiEvent::ToolCall {
-                                                                name: name.clone(),
-                                                                input: input.clone(),
-                                                            })
-                                                            .await;
-
-                                                        let result = agent
-                                                            .execute_tool(
-                                                                id.clone(),
-                                                                name.clone(),
-                                                                input.clone(),
-                                                            )
-                                                            .await;
-
-                                                        let (content, is_error) = match &result {
-                                                            ContentBlock::ToolResult {
-                                                                content,
-                                                                is_error,
-                                                                ..
-                                                            } => (
-                                                                content.clone(),
-                                                                is_error.unwrap_or(false),
-                                                            ),
-                                                            _ => (String::new(), false),
-                                                        };
-
-                                                        let _ = sender
-                                                            .send(UiEvent::ToolResult {
-                                                                content,
-                                                                is_error,
-                                                            })
-                                                            .await;
-
-                                                        tool_results.push(result);
-                                                    }
-                                                }
-                                            }
-
-                                            let assistant_content =
-                                                assistant_content_from_response(&response);
-
-                                            let assistant_message = MessageParam::Assistant(
-                                                AssistantMessage::new(assistant_content),
-                                            );
-                                            current_conversation.push(assistant_message.clone());
-                                            let _ = sender
-                                                .send(UiEvent::ConversationAppend(
-                                                    assistant_message,
-                                                ))
-                                                .await;
-
-                                            if tool_results.is_empty() {
-                                                break;
-                                            }
-
-                                            let tool_message =
-                                                MessageParam::User(UserMessage::new(tool_results));
-                                            current_conversation.push(tool_message.clone());
-                                            let _ = sender
-                                                .send(UiEvent::ConversationAppend(tool_message))
-                                                .await;
-                                        }
-                                        Err(e) => {
-                                            let _ =
-                                                sender.send(UiEvent::Error(e.to_string())).await;
-                                            break;
-                                        }
-                                    }
+                                if let Err(err) = client.send_message(msg).await {
+                                    let _ = sender.send(UiEvent::Error(err.to_string())).await;
                                 }
-                                let _ = sender.send(UiEvent::Info("Done".to_string())).await;
                             });
                         }
                     }
@@ -567,7 +467,7 @@ impl App {
     }
 }
 
-pub fn run_tui(agent: Agent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run_tui(client: ClientSession) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     let (_, rows) = size()?;
@@ -587,7 +487,37 @@ pub fn run_tui(agent: Agent) -> Result<(), Box<dyn std::error::Error + Send + Sy
         },
     )?;
 
-    let mut app = App::new(agent);
+    let mut app = App::new(client);
+
+    let stream_sender = app.sender.clone();
+    let stream_client = Arc::clone(&app.client);
+    let server_info = format!(
+        "Connected to {} (session {})",
+        stream_client.base_url(),
+        stream_client.session_id()
+    );
+    tokio::spawn(async move {
+        let _ = stream_sender.send(UiEvent::Info(server_info)).await;
+        let result = stream_client
+            .stream_events(|event| async {
+                let ui_event = match event {
+                    StreamEvent::Assistant { text } => UiEvent::ApiResponse(text),
+                    StreamEvent::ToolCall { name, input } => UiEvent::ToolCall { name, input },
+                    StreamEvent::ToolResult { content, is_error } => {
+                        UiEvent::ToolResult { content, is_error }
+                    }
+                    StreamEvent::Info { message } => UiEvent::Info(message),
+                    StreamEvent::Error { message } => UiEvent::Error(message),
+                    StreamEvent::Done => UiEvent::Done,
+                };
+                let _ = stream_sender.send(ui_event).await;
+            })
+            .await;
+
+        if let Err(err) = result {
+            let _ = stream_sender.send(UiEvent::Error(err.to_string())).await;
+        }
+    });
 
     let _guard = TerminalGuard::new();
 
